@@ -23,14 +23,14 @@ from wormlab3d.trajectories.pca import get_planarity_from_args
 from wormlab3d.trajectories.util import calculate_speeds, calculate_htd
 
 animate = False
-show_plots = True
+show_plots = False
 save_plots = True
-img_extension = 'png'
+img_extension = 'svg'
 fps = 25
 playback_speed = 10
 n_revolutions = 2
 
-tex_mode()
+# tex_mode()
 
 
 def get_trajectory(args: Namespace):
@@ -608,6 +608,60 @@ def plot_multiple_trajectories(
         plt.show()
 
 
+
+regions = [
+    {
+        'start_idx': 500,
+        'end_idx': 4000,
+        'colour': 'orange'
+    },
+    {
+        'start_idx': 5500,
+        'end_idx': 7000,
+        'colour': 'green'
+    },
+    {
+        'start_idx': 9000,
+        'end_idx': 11000,
+        'colour': 'orange'
+    },
+    {
+        'start_idx': 11000,
+        'end_idx': 12000,
+        'colour': 'green'
+    },
+    {
+        'start_idx': 12400,
+        'end_idx': 16500,
+        'colour': 'orange'
+    },
+    {
+        'start_idx': 16700,
+        'end_idx': 18000,
+        'colour': 'green'
+    },
+    {
+        'start_idx': 18100,
+        'end_idx': 19600,
+        'colour': 'orange'
+    },
+    {
+        'start_idx': 19700,
+        'end_idx': 20500,
+        'colour': 'green'
+    },
+    {
+        'start_idx': 20800,
+        'end_idx': 22000,
+        'colour': 'orange'
+    },
+    {
+        'start_idx': 22000,
+        'end_idx': 23000,
+        'colour': 'green'
+    },
+]
+
 def plot_trajectory_with_regions():
     """
     Draw the trajectory coloured by the time elapsed.
@@ -618,59 +672,6 @@ def plot_trajectory_with_regions():
     fig = plt.figure(figsize=(10, 10))
     # ax = fig.add_subplot(projection='3d', azim=95, elev=10)
     ax = fig.add_subplot(projection='3d', azim=-125, elev=35)
-
-    regions = [
-        {
-            'start_idx': 500,
-            'end_idx': 4000,
-            'colour': 'orange'
-        },
-        {
-            'start_idx': 5500,
-            'end_idx': 7000,
-            'colour': 'green'
-        },
-        {
-            'start_idx': 9000,
-            'end_idx': 11000,
-            'colour': 'orange'
-        },
-        {
-            'start_idx': 11000,
-            'end_idx': 12000,
-            'colour': 'green'
-        },
-        {
-            'start_idx': 12400,
-            'end_idx': 16500,
-            'colour': 'orange'
-        },
-        {
-            'start_idx': 16700,
-            'end_idx': 18000,
-            'colour': 'green'
-        },
-        {
-            'start_idx': 18100,
-            'end_idx': 19600,
-            'colour': 'orange'
-        },
-        {
-            'start_idx': 19700,
-            'end_idx': 20500,
-            'colour': 'green'
-        },
-        {
-            'start_idx': 20800,
-            'end_idx': 22000,
-            'colour': 'orange'
-        },
-        {
-            'start_idx': 22000,
-            'end_idx': 23000,
-            'colour': 'green'
-        },
-    ]
 
     for region in regions:
         if region['end_idx'] > len(X_slice):
@@ -715,6 +716,166 @@ def plot_trajectory_with_regions():
         plt.show()
 
 
+def plot_region_pauses():
+    """
+    Plot the pauses in each region.
+    Pauses are defined as periods where the centre-of-mass speed stays below 0.02 mm/s for at least 2 seconds.
+    """
+    args = get_args()
+    X_full, X_slice = get_trajectory(args)
+    dt = 1 / Trial.objects.get(id=args.trial).fps
+    speeds = calculate_speeds(X_full, signed=False) / dt
+    speed_threshold = 0.02  # mm/s
+    N = len(speeds)
+    ts = np.linspace(0, N * dt, N)
+
+    for region in regions:
+        speed_in_region = speeds[region['start_idx']:region['end_idx']]
+        ts_in_region = ts[region['start_idx']:region['end_idx']]
+        start_t = ts_in_region[0]
+
+        # Identify pauses
+        pause_mask = speed_in_region < speed_threshold
+        pauses = []
+        in_pause = False
+        pause_start_t = None
+        for i, is_pause in enumerate(pause_mask):
+            if is_pause and not in_pause:
+                in_pause = True
+                pause_start_t = i * dt
+            elif not is_pause and in_pause:
+                in_pause = False
+                pause_end_t = i * dt
+                if (pause_end_t - pause_start_t) >= 2:
+                    pauses.append((start_t + pause_start_t, start_t + pause_end_t))
+
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(ts_in_region, speed_in_region)
+        ax.axhline(y=speed_threshold, color='k', ls='--')
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('Speed (mm/s)')
+        ax.set_title(f'Trial {args.trial}. Speed in region {region["start_idx"]} to {region["end_idx"]} ({region["colour"]})')
+
+        # Highlight pauses
+        for pause_start_t, pause_end_t in pauses:
+            ax.axvspan(pause_start_t, pause_end_t, color='red', alpha=0.3)
+
+        fig.tight_layout()
+        if save_plots:
+            plt.savefig(
+                LOGS_PATH / f'{START_TIMESTAMP}_trajectory_speed_region'
+                            f'_trial={args.trial}'
+                            f'_{region["start_idx"]:05d}-{region["end_idx"]:05d}'
+                            f'_{region["colour"]}.{img_extension}',
+                transparent=True
+            )
+        if show_plots:
+            plt.show()
+
+
+
+def plot_single_region_pauses(
+        layout: str = 'paper',
+        start_idx: int = 500,
+        end_idx: int = 1000,
+):
+    """
+    Plot the pauses in a single region of the trajectory.
+    """
+    args = get_args()
+    X_full, X_slice = get_trajectory(args)
+    dt = 1 / Trial.objects.get(id=args.trial).fps
+    speeds = calculate_speeds(X_full, signed=False) / dt
+    speed_threshold = 0.02  # mm/s
+    N = len(speeds)
+    ts = np.linspace(0, N * dt, N)
+    speeds = speeds[start_idx:end_idx]
+    ts = ts[start_idx:end_idx]
+    start_t = ts[0]
+
+    # Identify pauses
+    pause_mask = speeds < speed_threshold
+    pauses = []
+    in_pause = False
+    pause_start_t = None
+    for i, is_pause in enumerate(pause_mask):
+        if is_pause and not in_pause:
+            in_pause = True
+            pause_start_t = i * dt
+        elif not is_pause and in_pause:
+            in_pause = False
+            pause_end_t = i * dt
+            if (pause_end_t - pause_start_t) >= 2:
+                pauses.append((start_t + pause_start_t, start_t + pause_end_t))
+
+    # Set up plot
+    if layout == 'paper':
+        plt.rc('axes', titlesize=7, titlepad=1)  # fontsize of the title
+        plt.rc('axes', labelsize=6, labelpad=1)  # fontsize of the x and y labels
+        plt.rc('xtick', labelsize=5)  # fontsize of the x tick labels
+        plt.rc('ytick', labelsize=5)  # fontsize of the y tick labels
+        plt.rc('ytick.major', pad=2, size=2)
+        plt.rc('ytick.minor', size=1)
+        plt.rc('xtick.major', pad=2, size=2)
+        plt.rc('legend', fontsize=5)  # fontsize of the legend
+        gs = GridSpec(
+            nrows=1,
+            ncols=1,
+            top=0.92,
+            bottom=0.16,
+            left=0.18,
+            right=0.98,
+        )
+        fig = plt.figure(figsize=(1.536, 1.536))
+        # ylabel_pad = -1
+    else:
+        plt.rc('axes', titlesize=9)  # fontsize of the title
+        plt.rc('axes', labelsize=8)  # fontsize of the x and y labels
+        plt.rc('xtick', labelsize=6.5)  # fontsize of the x tick labels
+        plt.rc('ytick', labelsize=6.5)  # fontsize of the y tick labels
+        plt.rc('legend', fontsize=7)  # fontsize of the legend
+        gs = GridSpec(
+            nrows=1,
+            ncols=1,
+            top=0.91,
+            bottom=0.16,
+            left=0.14,
+            right=0.99,
+        )
+        fig = plt.figure(figsize=(2.9, 2.3))
+        # ylabel_pad = 2
+
+    # Plot correlations
+    logger.info('Plotting')
+    ax = fig.add_subplot(gs[0, 0])
+    ax.plot(ts, speeds)
+    ax.axhline(y=speed_threshold, color='k', ls='--')
+
+    # Highlight pauses
+    for pause_start_t, pause_end_t in pauses:
+        ax.axvspan(pause_start_t, pause_end_t, color='red', alpha=0.3)
+
+    ax.set_title('Pauses')
+    ax.set_xlabel('Time (s)')
+    ax.set_ylabel('Speed (mm/s)')
+
+    if save_plots:
+        fn = START_TIMESTAMP \
+             + f'_trajectory_speed_region' \
+               f'_trial={args.trial}' \
+               f'_frames={start_idx}-{end_idx}' \
+               f'_sw={args.smoothing_window}'
+        save_path = LOGS_PATH / (fn + f'.{img_extension}')
+        logger.info(f'Saving plot to {save_path}.')
+        plt.savefig(save_path, transparent=True)
+
+    if show_plots:
+        plt.show()
+    plt.close(fig)
+
+
+
+
 if __name__ == '__main__':
     if save_plots:
         os.makedirs(LOGS_PATH, exist_ok=True)
@@ -725,8 +886,8 @@ if __name__ == '__main__':
     # plot_trajectory_signed_speed()
     # plot_trajectory_K()
     # plot_trajectory_planarity()
-    plot_trajectory_helicity()
-    plot_trajectory_posture_helicity()
+    # plot_trajectory_helicity()
+    # plot_trajectory_posture_helicity()
     # plot_brownian_trajectory()
     # plot_active_particle_trajectory()
     # plot_active_particle_trajectories()
@@ -741,3 +902,6 @@ if __name__ == '__main__':
     # )
 
     # plot_trajectory_with_regions()
+    # plot_region_pauses()
+    plot_single_region_pauses(start_idx=2000, end_idx=2500)
+
