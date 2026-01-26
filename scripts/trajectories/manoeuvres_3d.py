@@ -1751,6 +1751,16 @@ def plot_dataset_turn_angles_duration():
 
 
 def _manoeuvre_stats_identifiers(args: Namespace) -> str:
+    postfix = ''
+    if getattr(args, 'use_postures_in_pca', False):
+        postfix += '_ppca=1'
+    if args.manoeuvre_window < 0:
+        postfix += (f'_err={args.approx_error_limit}'
+                    f'_swk={args.smoothing_window_K}'
+                    f'_pwv={args.planarity_window_vertices}'
+                    f'_ad={args.approx_distance}'
+                    f'_ah={args.approx_curvature_height}'
+                    f'_aa={args.approx_max_attempts}')
     return f'manoeuvres_ds={args.dataset}' \
            f'_u={args.trajectory_point}' \
            f'_sw={args.smoothing_window}' \
@@ -1758,7 +1768,7 @@ def _manoeuvre_stats_identifiers(args: Namespace) -> str:
            f'_rd={args.min_reversal_distance}' \
            f'_ff={args.min_forward_frames}' \
            f'_fd={args.min_forward_distance}' \
-           f'_mw={args.manoeuvre_window}'
+           f'_mw={args.manoeuvre_window}{postfix}'
 
 
 def _generate_or_load_manoeuvre_stats(
@@ -1799,6 +1809,34 @@ def _generate_or_load_manoeuvre_stats(
             fps = reconstruction.trial.fps
             X_full, X_slice = get_trajectory(args)
 
+            tumble_idxs = None
+            if args.manoeuvre_window < 0:
+                from wormlab3d.particles.tumble_run import find_approximation
+                from wormlab3d.particles.util import calculate_trajectory_frame
+                from wormlab3d.trajectories.pca import generate_or_load_pca_cache
+
+                pcas, _ = generate_or_load_pca_cache(
+                    trial_id=reconstruction.trial.id,
+                    smoothing_window=args.smoothing_window,
+                    window_size=args.planarity_window,
+                    tracking_only=True,
+                )
+                e0, _, _ = calculate_trajectory_frame(X_full, pcas, args.planarity_window)
+                if args.approx_error_limit is None:
+                    raise ValueError('manoeuvre_window < 0 requires --approx-error-limit (for tumble detection).')
+                approx, _, _, _, _ = find_approximation(
+                    X=X_full,
+                    e0=e0,
+                    error_limit=args.approx_error_limit,
+                    planarity_window_vertices=args.planarity_window_vertices,
+                    distance_first=args.approx_distance,
+                    height_first=args.approx_curvature_height,
+                    max_iterations=args.approx_max_attempts,
+                    quiet=True,
+                )
+                _, _, tumble_idxs, _, _, _, _, _, _, _, _ = approx
+                tumble_idxs = np.asarray(tumble_idxs)
+
             # Loop over manoeuvres to get the turn statistics
             manoeuvres = get_manoeuvres(
                 X_full,
@@ -1809,7 +1847,9 @@ def _generate_or_load_manoeuvre_stats(
                 min_forward_distance=args.min_forward_distance,
                 window_size=args.manoeuvre_window,
                 cut_windows_at_manoeuvres=True,
-                align_components_with_traj=True
+                align_components_with_traj=True,
+                use_postures_in_pca=getattr(args, 'use_postures_in_pca', False),
+                tumble_idxs=tumble_idxs,
             )
             for m in manoeuvres:
                 res['angles'].append(m['angle_prev_next_n'])

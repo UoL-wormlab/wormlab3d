@@ -1,7 +1,6 @@
 import os
-from argparse import Namespace, ArgumentParser
-from typing import Dict
-from typing import Tuple
+from argparse import ArgumentParser, Namespace
+from typing import Dict, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -13,10 +12,10 @@ from wormlab3d import LOGS_PATH, START_TIMESTAMP, logger
 from wormlab3d.data.model import Dataset, Reconstruction
 from wormlab3d.particles.tumble_run import find_approximation
 from wormlab3d.particles.util import calculate_trajectory_frame
-from wormlab3d.toolkit.util import print_args, normalise
+from wormlab3d.toolkit.util import normalise, print_args, str2bool
 from wormlab3d.trajectories.angles import calculate_angle
 from wormlab3d.trajectories.cache import get_trajectory
-from wormlab3d.trajectories.manoeuvres import get_manoeuvres, align_with_traj
+from wormlab3d.trajectories.manoeuvres import align_with_traj, get_manoeuvres
 from wormlab3d.trajectories.pca import generate_or_load_pca_cache
 from wormlab3d.trajectories.util import calculate_speeds
 
@@ -72,6 +71,8 @@ def parse_args() -> Namespace:
                         help='Smoothing window for K.')
     parser.add_argument('--approx-max-attempts', type=int, default=50,
                         help='Max attempts to find an approximation.')
+    parser.add_argument('--use-postures-in-pca', type=str2bool, default=False,
+                        help='Fit PCA planes using full midlines (postures) rather than the trajectory point.')
 
     # Identifying complex turns (with reversals)
     parser.add_argument('--min-reversal-frames', type=int, default=25,
@@ -125,6 +126,9 @@ def _identifiers(args: Namespace, include_cluster_params: bool = False) -> str:
     if include_cluster_params:
         id_str += f'_cti={args.max_cluster_turn_interval}' \
                   f'_mcs={args.max_cluster_size}'
+
+    if args.use_postures_in_pca:
+        id_str += '_ppca=1'
 
     return id_str
 
@@ -181,11 +185,17 @@ def _calculate_trial_turn_data(
         height_first=args.approx_curvature_height,
         smooth_e0_first=args.approx_smooth_e0,
         smooth_K_first=args.approx_smooth_K,
-        max_attempts=args.approx_max_attempts, quiet=True
+        max_iterations=args.approx_max_attempts,
+        quiet=True
     )
     X_approx, vertices, tumble_idxs, run_durations, run_speeds, planar_angles_j, nonplanar_angles_j, twist_angles_j, _, _, _ = approx
 
-    # Fetch complex turns so we can exclude them
+    # Fetch complex turns so we can exclude them.
+    # If --manoeuvre-window=-1 is used for manoeuvre-angle windowing elsewhere, still exclude using a finite buffer.
+    manoeuvre_exclusion_window = args.manoeuvre_window
+    if manoeuvre_exclusion_window < 0:
+        manoeuvre_exclusion_window = args.turn_window if args.turn_window >= 0 else args.turn_window_min
+
     manoeuvres = get_manoeuvres(
         X,
         Xt,
@@ -193,7 +203,7 @@ def _calculate_trial_turn_data(
         min_reversal_distance=args.min_reversal_distance,
         min_forward_frames=args.min_forward_frames,
         min_forward_distance=args.min_forward_distance,
-        window_size=args.manoeuvre_window,
+        window_size=manoeuvre_exclusion_window,
         cut_windows_at_manoeuvres=False,
     )
     exclude_frames = np.zeros(T, dtype=bool)
@@ -203,15 +213,46 @@ def _calculate_trial_turn_data(
     # Get the simple turn statistics
     turns = []
     signed_speeds = calculate_speeds(X, signed=True)
+
+    def _fit_pca(start_idx: int, end_idx: int) -> PCA:
+        X_seg = X[start_idx:end_idx] if args.use_postures_in_pca else Xt[start_idx:end_idx]
+        if X_seg.ndim == 3:
+            X_seg = X_seg.reshape((-1, 3))
+        pca = PCA(svd_solver='full', copy=True, n_components=3)
+        pca.fit(X_seg)
+        return pca
+
     for i, tumble_idx in enumerate(tumble_idxs):
-        start_idx = max(0, tumble_idx - args.turn_window)
-        end_idx = min(len(X), tumble_idx + args.turn_window)
+        if args.turn_window < 0:
+            start_idx = 0
+            end_idx = len(X)
+        else:
+            start_idx = max(0, tumble_idx - args.turn_window)
+            end_idx = min(len(X), tumble_idx + args.turn_window)
 
         # Cut windows at turns
         if i > 0:
             start_idx = max(start_idx, tumble_idxs[i - 1])
         if i < len(tumble_idxs) - 1:
             end_idx = min(end_idx, tumble_idxs[i + 1])
+
+        # If --turn-window=-1, clamp the run windows at manoeuvres too.
+        if args.turn_window < 0:
+            if exclude_frames[tumble_idx]:
+                continue
+
+            man_frames_prev = exclude_frames[start_idx:tumble_idx]
+            if np.any(man_frames_prev):
+                last_exclude_offset = man_frames_prev.nonzero()[0].max()
+                start_idx = max(start_idx, start_idx + int(last_exclude_offset) + 1)
+
+            man_frames_next = exclude_frames[tumble_idx:end_idx]
+            if np.any(man_frames_next):
+                first_exclude_offset = man_frames_next.nonzero()[0].min()
+                end_idx = min(end_idx, tumble_idx + int(first_exclude_offset))
+
+            if start_idx >= tumble_idx or end_idx <= tumble_idx:
+                continue
 
         # Skip if the window is not big enough on either side
         if end_idx - tumble_idx < args.turn_window_min \
@@ -222,20 +263,15 @@ def _calculate_trial_turn_data(
         if np.any(exclude_frames[start_idx:end_idx]):
             continue
 
-        # Calculate incoming plane
+        # Calculate incoming/outgoing planes.
+        pca_inc = _fit_pca(start_idx, tumble_idx)
+        pca_out = _fit_pca(tumble_idx, end_idx)
+        pca_all = _fit_pca(start_idx, end_idx)
+
+        # Calculate the distance, speed and non-planarity for the whole manoeuvre window (trajectory point only).
         X_inc = Xt[start_idx:tumble_idx]
-        pca_inc = PCA(svd_solver='full', copy=True, n_components=3)
-        pca_inc.fit(X_inc)
-
-        # Calculate outgoing plane
         X_out = Xt[tumble_idx:end_idx]
-        pca_out = PCA(svd_solver='full', copy=True, n_components=3)
-        pca_out.fit(X_out)
-
-        # Calculate the distance, speed and non-planarity for the whole manoeuvre window
         X_window = Xt[start_idx:end_idx]
-        pca_all = PCA(svd_solver='full', copy=True, n_components=3)
-        pca_all.fit(X_window)
         duration = end_idx - start_idx
         distance = np.linalg.norm(X_window[1:] - X_window[:-1], axis=-1).sum()
         displacement = np.linalg.norm(X_window[0] - X_window[-1])
@@ -650,7 +686,137 @@ def plot_dataset_ip_angles_vs_n_turns(
         plt.rc('xtick', labelsize=5)  # fontsize of the x tick labels
         plt.rc('ytick', labelsize=5)  # fontsize of the y tick labels
         plt.rc('legend', fontsize=5)  # fontsize of the legend
-        fig, ax = plt.subplots(1, figsize=(2.56, 2.13), gridspec_kw={
+        fig, ax = plt.subplots(1, figsize=(3, 2.13), gridspec_kw={
+            'top': 0.93,
+            'bottom': 0.2,
+            'left': 0.13,
+            'right': 0.99,
+        })
+        # ax.set_title(f'Number of simple turns vs {which_angle} angle', pad=3)
+        xlabel_pad = 4
+        ylabel_pad = 0
+    else:
+        plt.rc('axes', labelsize=8)  # fontsize of the x and y labels
+        plt.rc('xtick', labelsize=6.5)  # fontsize of the x tick labels
+        plt.rc('ytick', labelsize=6.5)  # fontsize of the y tick labels
+        fig, ax = plt.subplots(1, figsize=(2.75, 2.3), gridspec_kw={
+            'top': 0.99,
+            'bottom': 0.22,
+            'left': 0.17,
+            'right': 0.99,
+        })
+        xlabel_pad = 6
+        ylabel_pad = 7
+
+    ax.set_xlabel('Number of simple turns', labelpad=xlabel_pad)
+    ax.set_ylabel('Interplane angle', labelpad=ylabel_pad)
+    # ax.set_yticks([0, 0.2, 0.4, 0.6, 0.8, 1])
+    ax.set_yticks([0, np.pi / 2])
+    ax.set_yticklabels([0, '$\pi/2$'])
+    ax.boxplot(data, labels=labels, widths=0.6)
+
+    if save_plots:
+        path = LOGS_PATH / (f'{START_TIMESTAMP}_{which_angle}_candlesticks'
+                            f'_{_identifiers(args, include_cluster_params=True)}'
+                            f'.{img_extension}')
+        logger.info(f'Saving plot to {path}.')
+        plt.savefig(path)
+
+    if show_plots:
+        plt.show()
+    plt.close(fig)
+
+
+def plot_dataset_ip_angles_vs_n_turns_with_complex_turn_comparison(
+        which_angle: str = 'planar',
+        layout: str = 'paper'
+):
+    """
+    Plot the distributions of turn angles against number of simple turns in a dataset, with an additional candlestick
+    showing the distribution of complex turns.
+    """
+    args = parse_args()
+    ds, ids, results = _generate_or_load_data(args, rebuild_cache=False, cache_only=False)
+    concs = [float(c) for c in results.keys()]
+
+    # Collate data
+    logger.info('Collating data.')
+    trial_intervals = [t for v in [results[c]['intervals'] for c in concs] for t in v]
+    use_angles = {
+        'trajectory': 'angles_t',
+        'planar': 'angles_n',
+        'runs': 'angles_p',
+    }
+    trial_angles = [a for v in [results[c][use_angles[which_angle]] for c in concs] for a in v]
+
+    # Loop over the trial results and put results into clusters
+    logger.info('Building clusters.')
+
+    def _filter_extend(out, values, offset, mask):
+        matched = values.diagonal(offset=offset)
+        out.extend(matched[mask])
+
+    cluster_sizes = np.arange(1, args.max_cluster_size + 1)
+    angles = {c: [] for c in cluster_sizes}
+    for i in range(len(trial_angles)):
+        for c in cluster_sizes:
+            # Find which turns are close enough to include in a cluster
+            intv = trial_intervals[i].diagonal(offset=c - 1)
+            close_enough = intv <= (c - 1) * args.max_cluster_turn_interval
+
+            # Add results
+            _filter_extend(angles[c], trial_angles[i], c - 1, close_enough)
+
+    # Divide up into bins
+    data = []
+    labels = []
+    start_c = 2 if which_angle == 'runs' else 1
+    for c in range(start_c, args.max_cluster_size + 1):
+        data.append(np.arcsin(np.sin(angles[c])))
+        labels.append(f'{c} turns\n({len(angles[c])})')
+
+    # Add complex turn data
+    from scripts.trajectories.manoeuvres_3d import _generate_or_load_manoeuvre_stats
+    args2 = Namespace()
+    args2.dataset = args.dataset
+    args2.trial = None
+    args2.midline3d_source = None
+    args2.midline3d_source_file = None
+    args2.start_frame = None
+    args2.end_frame = None
+    args2.directionality = None
+    args2.prune_slowest_ratio = None
+    args2.projection = None
+    args2.tracking_only = False
+    args2.rebuild_cache = False
+    args2.trajectory_point = args.trajectory_point
+    args2.smoothing_window = args.smoothing_window
+    args2.use_postures_in_pca = args.use_postures_in_pca
+    args2.planarity_window = args.planarity_window
+    args2.planarity_window_vertices = args.planarity_window_vertices
+    args2.smoothing_window_K = args.smoothing_window_K
+    args2.approx_error_limit = args.approx_error
+    args2.approx_distance = args.approx_distance
+    args2.approx_curvature_height = args.approx_curvature_height
+    args2.approx_max_attempts = args.approx_max_attempts
+    args2.min_forward_frames = args.min_forward_frames
+    args2.min_forward_distance = args.min_forward_distance
+    args2.min_reversal_frames = args.min_reversal_frames
+    args2.min_reversal_distance = args.min_reversal_distance
+    args2.manoeuvre_window = args.turn_window
+    res = _generate_or_load_manoeuvre_stats(args2, rebuild_cache=False, cache_only=False)
+    complex_angles = np.arcsin(np.sin(res['angles']))
+    data.append(complex_angles)
+    labels.append(f'Complex turns\n({len(complex_angles)})')
+
+    # Set up plot
+    if layout == 'paper':
+        plt.rc('axes', titlesize=7)  # fontsize of the title
+        plt.rc('axes', labelsize=6)  # fontsize of the x and y labels
+        plt.rc('xtick', labelsize=5)  # fontsize of the x tick labels
+        plt.rc('ytick', labelsize=5)  # fontsize of the y tick labels
+        plt.rc('legend', fontsize=5)  # fontsize of the legend
+        fig, ax = plt.subplots(1, figsize=(3.3, 2.13), gridspec_kw={
             'top': 0.93,
             'bottom': 0.2,
             'left': 0.13,
@@ -675,13 +841,19 @@ def plot_dataset_ip_angles_vs_n_turns(
     ax.set_xlabel('Number of simple turns', labelpad=xlabel_pad)
     ax.set_ylabel('IP angle', labelpad=ylabel_pad)
     # ax.set_yticks([0, 0.2, 0.4, 0.6, 0.8, 1])
-    ax.set_yticks([0, np.pi/2])
+    ax.set_yticks([0, np.pi / 2])
     ax.set_yticklabels([0, '$\pi/2$'])
     ax.boxplot(data, labels=labels, widths=0.6)
 
     if save_plots:
-        path = LOGS_PATH / (f'{START_TIMESTAMP}_{which_angle}_candlesticks'
+        path = LOGS_PATH / (f'{START_TIMESTAMP}_{which_angle}_candlesticks_with_complex_turns'
                             f'_{_identifiers(args, include_cluster_params=True)}'
+                            f'_u={args2.trajectory_point}'
+                            f'_rf={args2.min_reversal_frames}'
+                            f'_rd={args2.min_reversal_distance}'
+                            f'_ff={args2.min_forward_frames}'
+                            f'_fd={args2.min_forward_distance}'
+                            f'_mw={args2.manoeuvre_window}'
                             f'.{img_extension}')
         logger.info(f'Saving plot to {path}.')
         plt.savefig(path)
@@ -699,4 +871,5 @@ if __name__ == '__main__':
 
     # plot_simple_turn_angles()
     # plot_dataset_ip_angles_vs_n_turns(which_angle='planar')
-    plot_dataset_ip_angles_vs_n_turns(which_angle='runs', layout='paper')
+    plot_dataset_ip_angles_vs_n_turns(which_angle='planar', layout='paper')
+    # plot_dataset_ip_angles_vs_n_turns_with_complex_turn_comparison(which_angle='planar', layout='paper')

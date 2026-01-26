@@ -110,6 +110,8 @@ def get_args(
                             help='Minimum reversal distance to use to identify a manoeuvre.')
         parser.add_argument('--manoeuvre-window', type=int, default=500,
                             help='Number of frames to include either side of a detected manoeuvre.')
+        parser.add_argument('--use-postures-in-pca', type=str2bool, default=False,
+                            help='Fit PCA planes using full midlines (postures) rather than the trajectory point.')
 
     # Approximation arguments
     if include_approximation_options:

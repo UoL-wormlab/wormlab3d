@@ -405,8 +405,8 @@ def find_approximation(
 
         if mse > error_limit:
             distance = max(distance_min, distance - 10)
-            # if attempts > 5:
-            height = max(10, height - 1)
+            if iteration > 5:
+                height = max(10, height - 1)
             smooth_e0 = max(11, smooth_e0 - 6)
             smooth_K = max(11, smooth_K - 6)
 

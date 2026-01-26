@@ -1,4 +1,4 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import numpy as np
 from scipy.signal import find_peaks
@@ -33,11 +33,16 @@ def get_manoeuvres(
         min_forward_distance: float = 0.,
         window_size: int = 500,
         cut_windows_at_manoeuvres: bool = False,
-        align_components_with_traj: bool = False
+        align_components_with_traj: bool = False,
+        use_postures_in_pca: bool = False,
+        tumble_idxs: Optional[np.ndarray] = None,
 ) -> List[Dict[str, Any]]:
     """
     Get the manoeuvre sections, the parts prior and subsequent to a reversal.
     """
+    if window_size < 0:
+        assert cut_windows_at_manoeuvres, 'window_size < 0 requires cut_windows_at_manoeuvres=True.'
+
     signed_speeds = calculate_speeds(X_full, signed=True)
     reversing = signed_speeds < 0
     reversal_centre_idxs, reversal_props = find_peaks(reversing, width=min_reversal_frames)
@@ -64,6 +69,14 @@ def get_manoeuvres(
         # Recalculate peaks
         reversal_centre_idxs, reversal_props = find_peaks(reversing, width=min_reversal_frames)
 
+    def _fit_pca(start_idx: int, end_idx: int) -> PCA:
+        X = X_full[start_idx:end_idx] if use_postures_in_pca else X_slice[start_idx:end_idx]
+        if X.ndim == 3:
+            X = X.reshape((-1, 3))
+        pca = PCA(svd_solver='full', copy=True, n_components=3)
+        pca.fit(X)
+        return pca
+
     # Loop over reversal events
     for i, reversal_centre_idx in enumerate(reversal_centre_idxs):
         # Identify the plane of motion during the reversal
@@ -76,35 +89,45 @@ def get_manoeuvres(
         if reversal_distance < min_reversal_distance:
             continue
 
-        pca_rev = PCA(svd_solver='full', copy=True, n_components=3)
-        pca_rev.fit(X_rev)
+        pca_rev = _fit_pca(rev_start_idx, rev_end_idx)
 
         # Identify the plane of motion prior to the reversal
         prev_end_idx = reversal_props['left_bases'][i]
-        prev_start_idx = max(0, prev_end_idx - window_size)
+        if window_size < 0:
+            prev_start_idx = 0
+        else:
+            prev_start_idx = max(0, prev_end_idx - window_size)
         if i > 0 and cut_windows_at_manoeuvres:
             prev_start_idx = max(reversal_props['right_bases'][i - 1], prev_start_idx)
+        if window_size < 0 and tumble_idxs is not None:
+            prev_tumble_idxs = tumble_idxs[tumble_idxs < prev_end_idx]
+            if len(prev_tumble_idxs):
+                prev_start_idx = max(prev_start_idx, int(prev_tumble_idxs[-1]))
         X_prev = X_slice[prev_start_idx:prev_end_idx]
         if X_prev.shape[0] < 10:
             continue
-        pca_prev = PCA(svd_solver='full', copy=True, n_components=3)
-        pca_prev.fit(X_prev)
+        pca_prev = _fit_pca(prev_start_idx, prev_end_idx)
 
         # Identify the plane of motion subsequent to the reversal
         next_start_idx = reversal_props['right_bases'][i] - 1
-        next_end_idx = next_start_idx + window_size
+        if window_size < 0:
+            next_end_idx = len(X_slice)
+        else:
+            next_end_idx = next_start_idx + window_size
         if i < len(reversal_centre_idxs) - 1 and cut_windows_at_manoeuvres:
             next_end_idx = min(reversal_props['left_bases'][i + 1], next_end_idx)
+        if window_size < 0 and tumble_idxs is not None:
+            next_tumble_idxs = tumble_idxs[tumble_idxs > next_start_idx]
+            if len(next_tumble_idxs):
+                next_end_idx = min(next_end_idx, int(next_tumble_idxs[0]))
         X_next = X_slice[next_start_idx:next_end_idx]
         if X_next.shape[0] < 10:
             continue
-        pca_next = PCA(svd_solver='full', copy=True, n_components=3)
-        pca_next.fit(X_next)
+        pca_next = _fit_pca(next_start_idx, next_end_idx)
 
         # Calculate the distance, speed and non-planarity for the whole manoeuvre window
         X_window = X_slice[prev_start_idx:next_end_idx]
-        pca_all = PCA(svd_solver='full', copy=True, n_components=3)
-        pca_all.fit(X_window)
+        pca_all = _fit_pca(prev_start_idx, next_end_idx)
         duration_all = next_end_idx - prev_start_idx
         distance_all = np.linalg.norm(X_window[1:] - X_window[:-1], axis=-1).sum()
         displacement = np.linalg.norm(X_window[0] - X_window[-1])
